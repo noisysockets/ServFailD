@@ -30,7 +30,14 @@ import (
 var logger = slog.Default()
 
 func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	for _, q := range r.Question {
+		logger.Info("Received DNS query",
+			slog.Any("name", q.Name),
+			slog.Any("type", dns.TypeToString[q.Qtype]))
+	}
+
 	m := &dns.Msg{}
+	m.SetReply(r)
 	m.SetRcode(r, dns.RcodeServerFailure)
 	if err := w.WriteMsg(m); err != nil {
 		logger.Warn("Failed to write DNS response", slog.Any("error", err))

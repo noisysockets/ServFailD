@@ -13,7 +13,7 @@ docker:
   COPY (+servfaild/servfaild --GOARCH=${TARGETARCH}) /usr/local/bin/servfaild
   USER 65532:65532
   EXPOSE 5353/udp 5353/tcp
-  ENTRYPOINT ["//usr/local/bin/servfaild"]
+  ENTRYPOINT ["/usr/local/bin/servfaild"]
   ARG VERSION=latest-dev
   SAVE IMAGE --push ghcr.io/noisysockets/servfaild:${VERSION}
   SAVE IMAGE --push ghcr.io/noisysockets/servfaild:latest
