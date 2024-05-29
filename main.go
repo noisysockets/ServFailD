@@ -17,14 +17,18 @@ package main // SPDX-License-Identifier: MPL-2.0
  */
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/errgroup"
 )
 
 var logger = slog.Default()
@@ -50,12 +54,8 @@ func main() {
 
 	flag.Parse()
 
-	lis, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		logger.Error("Failed to listen on TCP port", slog.Any("error", err))
-		os.Exit(1)
-	}
-	defer lis.Close()
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", handleDNSRequest)
 
 	pc, err := net.ListenPacket("udp", listenAddr)
 	if err != nil {
@@ -64,31 +64,65 @@ func main() {
 	}
 	defer pc.Close()
 
-	srv := &dns.Server{
-		Listener:   lis,
+	udpServer := &dns.Server{
+		Handler:    mux,
 		PacketConn: pc,
 	}
 
-	dns.HandleFunc(".", handleDNSRequest)
+	lis, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		logger.Error("Failed to listen on TCP port", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer lis.Close()
 
-	// Gracefully shutdown the server.
+	tcpServer := &dns.Server{
+		Handler:  mux,
+		Listener: lis,
+	}
+
+	g, ctx := errgroup.WithContext(context.Background())
+
+	// Gracefully shutdown the server when a signal is received.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-
-		logger.Info("Shutting down DNS server")
-
-		if err := srv.Shutdown(); err != nil {
-			logger.Error("Failed to shutdown DNS server", slog.Any("error", err))
-			os.Exit(1)
+	g.Go(func() error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-sig:
+			return context.Canceled
 		}
-	}()
+	})
 
-	logger.Info("Listening for DNS queries", slog.Any("address", lis.Addr().String()))
+	// We have to use multiple server instances as we can't serve both UDP and TCP
+	// at the same time on the one server instance.
+	for _, srv := range []*dns.Server{udpServer, tcpServer} {
+		srv := srv
 
-	if err := srv.ActivateAndServe(); err != nil {
-		logger.Error("Failed to start DNS server", slog.Any("error", err))
+		g.Go(func() error {
+			g.Go(func() error {
+				<-ctx.Done()
+
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				if err := srv.ShutdownContext(shutdownCtx); err != nil {
+					return err
+				}
+
+				return nil
+			})
+
+			return srv.ActivateAndServe()
+		})
+	}
+
+	logger.Info("Listening for DNS queries (UDP/TCP)",
+		slog.Any("address", lis.Addr().String()))
+
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		logger.Error("Failed to serve DNS", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
